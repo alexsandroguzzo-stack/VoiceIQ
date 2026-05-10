@@ -572,19 +572,22 @@ function doStop(){
   document.getElementById('timer').textContent=fmtT(0);
   refreshUI();
   if(mediaRec&&mediaRec.state!=='inactive'){
+    const mimeType=mediaRec.mimeType||'audio/webm';
     mediaRec.onstop=()=>{
-      const blob=new Blob(chunks,{type:mediaRec.mimeType||'audio/webm'});
-      addRec({dur,blob,url:URL.createObjectURL(blob),transcript:captured||null});
+      const blob=new Blob(chunks,{type:mimeType});
+      const url=URL.createObjectURL(blob);
+      // Use Speech API transcript if captured, otherwise blob will be sent to Claude
+      addRec({dur,blob,url,transcript:captured||null,mimeType});
       mediaRec.stream?.getTracks().forEach(t=>t.stop()); mediaRec=null;
     };
     mediaRec.stop();
   } else {
-    addRec({dur,blob:null,url:null,transcript:captured||null});
+    addRec({dur,blob:null,url:null,transcript:captured||null,mimeType:null});
   }
 }
 
-function addRec({dur,blob,url,transcript}){
-  const rec={id:Date.now(),name:`Gravação ${recordings.length+1}`,ts:Date.now(),duration:dur,blob,url,transcript:transcript||null,analysis:null};
+function addRec({dur,blob,url,transcript,mimeType}){
+  const rec={id:Date.now(),name:`Gravação ${recordings.length+1}`,ts:Date.now(),duration:dur,blob,url,transcript:transcript||null,mimeType:mimeType||null,analysis:null};
   recordings.unshift(rec);
   renderList();
 }
@@ -630,32 +633,104 @@ async function openRec(id){
   document.getElementById('sheetBg').style.display='flex';
   currentTab='resumo'; setActiveTab('resumo');
   if(rec.analysis){renderTab(rec);return;}
-  showLoading('Preparando análise…');
-  // Get transcript
-  let transcript=rec.transcript||'';
-  if(!transcript){transcript='[Transcrição não disponível — fale próximo ao microfone e permita o acesso ao microfone.]';}
-  rec.transcript=transcript;
-  recordings=recordings.map(r=>r.id===id?rec:r);
-  showLoading('Analisando com IA…');
-  const sys='Consultor estratégico sênior. Analise reuniões em português brasileiro. Responda SOMENTE com JSON válido, sem markdown.';
-  const usr=`Analise a transcrição e retorne este JSON em português:
+
+  // ── STEP 1: Transcribe audio ──────────────────────────────────────────────
+  let transcript = rec.transcript || '';
+
+  if(!transcript && rec.blob){
+    showLoading('🎙️ Transcrevendo o áudio com IA…');
+    try{
+      // Convert blob to base64
+      const b64 = await new Promise((res,rej)=>{
+        const fr=new FileReader();
+        fr.onload=()=>res(fr.result.split(',')[1]);
+        fr.onerror=rej;
+        fr.readAsDataURL(rec.blob);
+      });
+
+      // Detect media type — Safari records as mp4 usually
+      const mtype = rec.mimeType || rec.blob.type || 'audio/mp4';
+
+      const resp = await fetch('https://api.anthropic.com/v1/messages',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          model: MODEL,
+          max_tokens: 4000,
+          messages:[{
+            role:'user',
+            content:[
+              {
+                type:'text',
+                text:'Você é um transcritor profissional. Transcreva TUDO que foi falado neste áudio em português brasileiro, com fidelidade total. Inclua cada palavra dita. Retorne APENAS o texto transcrito, sem introduções, sem comentários, sem formatação extra.'
+              },
+              {
+                type:'document',
+                source:{
+                  type:'base64',
+                  media_type: mtype,
+                  data: b64
+                }
+              }
+            ]
+          }]
+        })
+      });
+
+      const data = await resp.json();
+      const txt = (data.content||[]).map(b=>b.text||'').join('').trim();
+      if(txt && txt.length > 3 && !txt.startsWith('[')){
+        transcript = txt;
+      } else {
+        // API couldn't process audio format — try with audio tag
+        transcript = '';
+      }
+    } catch(e){
+      console.warn('Transcription error:', e);
+      transcript = '';
+    }
+  }
+
+  // If still no transcript, show helpful message
+  if(!transcript){
+    transcript = 'Não foi possível transcrever automaticamente este áudio.\n\nIsso pode ocorrer porque:\n• O Safari bloqueou o microfone\n• O formato do áudio não é suportado\n• A gravação ficou muito curta\n\nDica: Abra o app pelo Safari (não pelo Chrome) e permita o microfone quando solicitado.';
+  }
+
+  rec.transcript = transcript;
+  recordings = recordings.map(r=>r.id===id?rec:r);
+
+  // ── STEP 2: Analyse with Claude ───────────────────────────────────────────
+  showLoading('🤖 Analisando com IA…');
+
+  const sys='Consultor estratégico sênior. Analise reuniões em português brasileiro. Responda SOMENTE com JSON válido, sem markdown, sem texto fora do JSON.';
+  const usr=`Analise a transcrição abaixo e retorne este JSON exato (todos os valores em português):
 {
-  "resumo": "3-4 frases resumindo o conteúdo",
-  "sentimento": {"nivel": 70, "descricao": "tom geral da conversa", "motivadores": ["fator 1", "fator 2"]},
-  "pontos_principais": ["ponto 1", "ponto 2", "ponto 3"],
-  "proximos_passos": ["ação 1 — responsável, prazo", "ação 2"],
-  "decisoes": ["decisão 1", "decisão 2"],
+  "resumo": "3-4 frases executivas resumindo o conteúdo da conversa",
+  "sentimento": {"nivel": 70, "descricao": "tom geral da conversa", "motivadores": ["fator positivo 1", "fator 2"]},
+  "pontos_principais": ["ponto 1", "ponto 2", "ponto 3", "ponto 4"],
+  "proximos_passos": ["ação 1 — responsável, prazo", "ação 2", "ação 3"],
+  "decisoes": ["decisão 1 tomada", "decisão 2"],
   "palavras_chave": ["palavra1", "palavra2", "palavra3", "palavra4", "palavra5"]
 }
 
 TRANSCRIÇÃO:
 ${transcript}`;
+
   try{
-    const resp=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:MODEL,max_tokens:1200,system:sys,messages:[{role:'user',content:usr}]})});
+    const resp=await fetch('https://api.anthropic.com/v1/messages',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:MODEL,max_tokens:1500,system:sys,messages:[{role:'user',content:usr}]})
+    });
     const data=await resp.json();
-    rec.analysis=parseJ((data.content||[]).map(b=>b.text||'').join(''))||fallback(transcript);
-  } catch(e){rec.analysis=fallback(transcript);}
-  recordings=recordings.map(r=>r.id===id?rec:r); renderList();
+    const raw=(data.content||[]).map(b=>b.text||'').join('');
+    rec.analysis=parseJ(raw)||fallback(transcript);
+  } catch(e){
+    rec.analysis=fallback(transcript);
+  }
+
+  recordings=recordings.map(r=>r.id===id?rec:r);
+  renderList();
   renderTab(rec);
 }
 
